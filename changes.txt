@@ -1,0 +1,17 @@
+download cookbook,
+ - show what the code does
+
+create_cookbook
+ - show what the code does
+
+deployment workflow
+ - show staging -> prod
+
+explain how "Move Logic to Libraries" works
+ - what is "Logic"
+
+Emphaize "make it easy for developers to copy code from one cookbook to another"
+
+high level apis
+ - Be very opinionated
+ - Make decisions for your developers (because they dont know)
