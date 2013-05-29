@@ -1,0 +1,279 @@
+#!/bin/bash
+# -*- Mode: shell-script; -*-
+
+silent_unset () {
+    unset $@ 2> /dev/null
+}
+
+silent_unset -f yipchef
+
+function yipchef() {
+    yipit
+    cd $CHEF_PATH
+    if [ -n "$1" ]
+    then
+        cd $CHEF_PATH/cookbooks/$1
+    fi
+}
+
+function knife_test() {
+    set +e
+
+    local grep_code
+    echo "Testing Cookbook Syntax with Knife..."
+    # Use egrep to limit to just error lines (stderr not respected by knife)
+    # Should just include lines with FATAL and
+    # Weird PWD syntax is just grabbing the name of your current dir
+    bundle exec knife cookbook test ${PWD##*/} -c ${CHEF_PATH}/staging/knife.rb  | egrep [A-Z][A-Z]; grep_code=$?
+
+    set -e
+
+    if [ "${grep_code}" == "0" ]
+    then
+        echo "Failed!..."
+        return 1
+    else
+        echo
+        echo "Ok!..."
+    fi
+
+}
+
+function foodcritic_test() {
+
+    echo "Using Foodcritic to lint our cookbooks..."
+
+    # Ignore Rule 34 because it does not understand for/each loops in templates
+    rules="FC001,FC002,FC003,FC004,FC005,FC006,FC007,FC008,FC009,FC010,FC011,FC012,FC013,FC014,FC015,FC016,FC018,FC019,FC020,FC021,FC022,FC023,FC024,FC025,FC026,FC027,FC028,FC029,FC030,FC031,FC032,FC033,FC035,FC036,FC037,FC038,FC039,FC040,FC041,FC042,FC043,FC044,FC045,ETSY001,ETSY002,ETSY003,ETSY004,ETSY005,ETSY006,ETSY007"
+
+    # Stricter Etsy rules included w/ autofail
+    bundle exec foodcritic -t ${rules} -f any -I ${CHEF_PATH}/settings/rules.rb .
+
+    if [ "$?" != "0" ]
+    then
+        echo "Failed!..."
+        return 1
+    else
+        echo "Ok!..."
+    fi
+
+}
+
+function rspec_test() {
+
+    set +e
+    echo "Running Spec Tests..."
+
+    # Make sure we have rspec installed
+    bundle exec rspec --help &> /dev/null
+    if [ "$?" == "0" ]
+    then
+        bundle exec rspec .
+        if [ "$?" != "0" ]
+        then
+            echo "Failed!..."
+            return 1
+        fi
+    fi
+
+    # We are migrating to use minitest
+    bundle exec rake --help &> /dev/null
+    if [ "$?" == "0" ]
+    then
+        bundle exec rake test
+        if [ "$?" != "0" ]
+        then
+            echo "Failed!..."
+            return 1
+        fi
+    fi
+    set -e
+}
+
+function _clone_cookbook() {
+    cookbook=$1
+    clean=$2
+
+    if [ ! -d ${CHEF_PATH}/cookbooks/${cookbook} ]
+    then
+        if [ -z "${clean}" ]
+        then
+            git clone git@github.com:yipit-cookbooks/${cookbook} ${CHEF_PATH}/cookbooks/${cookbook}
+        else
+            git clone git@github.com:yipit-cookbooks/cookbook_base ${CHEF_PATH}/cookbooks/${cookbook}
+        fi
+    fi
+
+}
+
+function _link_cookbook_files() {
+    cookbook=$1
+
+    if [ ! -e ${CHEF_PATH}/cookbooks/${cookbook}/.git/hooks/pre-commit ]
+    then
+        ln -s ${CHEF_PATH}/settings/pre-commit ${CHEF_PATH}/cookbooks/${cookbook}/.git/hooks/pre-commit
+    fi
+
+    for file in Makefile chefignore Berksfile Gemfile
+    do
+        if [ ! -e ${CHEF_PATH}/cookbooks/${cookbook}/${file} ]
+        then
+            ln -s ${CHEF_PATH}/settings/${file} ${CHEF_PATH}/cookbooks/${cookbook}/${file}
+        fi
+    done
+
+    if [ ! -e ${CHEF_PATH}/cookbooks/${cookbook}/.gitignore ]
+    then
+        ln -s ${CHEF_PATH}/settings/gitignore ${CHEF_PATH}/cookbooks/${cookbook}/.gitignore
+    fi
+
+}
+
+function _check_input() {
+    # Be aware this is just making sure we have a cookbook name, not
+    # that it is valid or attempting command injection etc.
+
+    local cookbook_name=${1}
+
+    if [ -z "${cookbook_name}" ]
+    then
+        echo "You must input a cookbook name" >&2
+        return 1
+    else
+        return 0
+    fi
+
+}
+
+function download_cookbook() {
+    cookbook=${1}
+
+    if _check_input ${cookbook}
+    then
+        _clone_cookbook ${cookbook}
+
+        _link_cookbook_files ${cookbook}
+
+        cd ${CHEF_PATH}/cookbooks/${cookbook}
+
+        make install
+    else
+        return 1
+    fi
+
+}
+
+function create_cookbook() {
+    cookbook=${1}
+
+    if _check_input ${cookbook}
+    then
+        _clone_cookbook ${cookbook} clean
+
+        rm -rf ${CHEF_PATH}/cookbooks/${cookbook}/.git
+
+        git init ${CHEF_PATH}/cookbooks/${cookbook}
+
+        _link_cookbook_files ${cookbook}
+
+        cd ${CHEF_PATH}/cookbooks/${cookbook}
+
+        make install
+
+        find . -type f -exec sed -i '' "s/cookbook_base/$cookbook/g" {} \;
+
+        git add .
+        git commit -m "Initial Commit" --no-verify
+        git remote add origin git@github.com:yipit-cookbooks/${cookbook}.git
+    else
+        return 1
+    fi
+
+}
+
+function update_cookbooks() {
+    for directory in ${CHEF_PATH}/cookbooks/yipit_*; do
+        pushd $directory > /dev/null
+            echo Pulling latest version of ${directory}
+            git pull origin master
+            echo
+        popd
+    done
+}
+
+function deploy_cookbook() {
+    EXPECTED_ARGS=2
+    BAD_ARGS_ERROR_CODE=65
+
+    if [ $# -ne $EXPECTED_ARGS ]; then
+        echo 'Usage: deploy_cookbook ${ENV} ${COOKBOOK}'
+        return $BAD_ARGS_ERROR_CODE
+    fi
+
+    environment=$1
+    cookbook=$2
+
+    # Normalize Environment
+    if [[ $environment == "prod" ]]; then
+        environment=production
+    fi
+
+    if [[ $environment == "staging" ]]; then
+        freeze=""
+    else
+        freeze="--freeze"
+    fi
+
+    pushd $CHEF_PATH > /dev/null
+        bundle exec knife cookbook upload $cookbook $freeze -c ${CHEF_PATH}/${environment}/knife.rb
+        bundle exec knife spork promote $environment $cookbook -c ${CHEF_PATH}/staging/knife.rb
+        bundle exec knife environment from file ${CHEF_PATH}/environments/${environment}.json -c ${CHEF_PATH}/${environment}/knife.rb
+    popd > /dev/null
+
+}
+
+function freeze_cookbook_staging() {
+    EXPECTED_ARGS=1
+    BAD_ARGS_ERROR_CODE=65
+
+    if [ $# -ne $EXPECTED_ARGS ]
+    then
+        echo 'Usage: deploy_cookbook ${ENV} ${COOKBOOK}'
+        return ${BAD_ARGS_ERROR_CODE}
+    fi
+
+    cookbook=$1
+
+    bundle exec knife cookbook upload ${cookbook} --freeze -c ${CHEF_PATH}/staging/knife.rb
+
+}
+
+function bump_cookbook_version() {
+    EXPECTED_ARGS=1
+    BAD_ARGS_ERROR_CODE=65
+
+    if [ $# -ne $EXPECTED_ARGS ]
+    then
+        echo 'Usage: bump_cookbook_version ${COOKBOOK}'
+        return ${BAD_ARGS_ERROR_CODE}
+    fi
+
+    cookbook=$1
+
+    pushd $CHEF_PATH > /dev/null
+        bundle exec knife spork bump ${cookbook} patch -c ${CHEF_PATH}/staging/knife.rb
+    popd > /dev/null
+
+}
+
+function print_code_coverage() {
+    COVERAGE_FILE="coverage/.last_run.json"
+    if [ -a "${COVERAGE_FILE}" ]
+    then
+        coverage=$(cat ${COVERAGE_FILE} | grep "covered_percent" | awk '{print $2}')
+        echo "Code Coverage: ${coverage}%"
+    fi
+
+}
+
+export YIPIT_VAGRANT_BOX="Yipit12.04.2-11.4.4"

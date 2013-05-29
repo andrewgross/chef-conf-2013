@@ -1,0 +1,43 @@
+#!/bin/bash
+
+set -e
+
+function git_stash() {
+    output=""
+    echo "Stashing changes before running tests..."
+    output=$(git stash --include-untracked --keep-index)
+
+    if [ "$?" != "0" ]
+    then
+        echo "Failed!..."
+        exit 1
+    else
+        set +e
+        unchanged=$( echo ${output} | grep 'No local' )
+        set -e
+        echo "Ok!..."
+        echo
+    fi
+
+}
+
+function git_unstash() {
+
+    echo "Restoring stashed changes..."
+    if [ -z "${unchanged}" ]
+    then
+        git stash pop --quiet --index
+    fi
+
+}
+
+source ${CHEF_PATH}/settings/yipit_chef_functions
+
+# Stash any uncommitted changes so we are testing the right things
+git_stash
+
+# Unstash on exit
+trap git_unstash EXIT
+
+make test
+
